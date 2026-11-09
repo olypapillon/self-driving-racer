@@ -1,7 +1,9 @@
+import asyncio
 import bisect
 import json
 import math
 import random
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +13,8 @@ import pygame
 import drivers
 from drivers import ALGORITHMS
 
+
+IN_BROWSER = sys.platform == "emscripten"
 
 SCREEN_WIDTH = 1100
 SCREEN_HEIGHT = 900
@@ -1648,7 +1652,9 @@ def draw_results(screen, font, race):
     screen.blit(footer, (left, top + (len(rows) + 1) * line_height))
 
 
-def main():
+async def main():
+    """The game loop. It is async so the browser build (pygbag) can hand
+    control back to the page once per frame; on the desktop it runs the same."""
     pygame.init()
     clock = pygame.time.Clock()
     screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
@@ -1731,7 +1737,11 @@ def main():
         # tick() sleeps, and on macOS the sleep overshoots unevenly; some frames
         # then run no physics step and others two, which reads as jumping.
         # tick_busy_loop() waits precisely at the cost of a little CPU.
-        frame_time = min(clock.tick_busy_loop(FPS) / 1000, 0.25)
+        # In the browser a busy loop would freeze the page, so use tick().
+        if IN_BROWSER:
+            frame_time = min(clock.tick(FPS) / 1000, 0.25)
+        else:
+            frame_time = min(clock.tick_busy_loop(FPS) / 1000, 0.25)
         sim_speed = SIM_SPEEDS[sim_speed_index]
         accumulator += frame_time * sim_speed
 
@@ -1834,6 +1844,7 @@ def main():
         if player.finish_time is not None:
             draw_results(screen, results_font, race)
         pygame.display.flip()
+        await asyncio.sleep(0)
 
     pygame.quit()
 
@@ -1864,4 +1875,4 @@ def simulate(algorithm, mode="Time trial", seed=0, max_time=90.0, brain=None, on
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
