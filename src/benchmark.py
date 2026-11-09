@@ -11,10 +11,12 @@ grid is reshuffled each seed and the camera car (which bumps never move) is
 rotated through the algorithms, so no one keeps an advantage.
 
 Writes leaderboard.json, ghosts/<algorithm>.json (each one's best time-trial
-run) and updates ghosts/leader.json if an algorithm beat the stored leader.
+run), the leaderboard table in README.md, and updates ghosts/leader.json if an
+algorithm beat the stored leader.
+
+    uv run python src/benchmark.py --readme-only   # just redraw the README table
 """
 
-import importlib.util
 import json
 import os
 import statistics
@@ -26,11 +28,14 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 SRC = Path(__file__).resolve().parent
 ROOT = SRC.parent
 sys.path.insert(0, str(SRC))
-import drivers  # noqa: E402
+from racer import drivers  # noqa: E402
+from racer.ghost import Ghost, load_ghost, save_ghost  # noqa: E402
+from racer.race import simulate, standings  # noqa: E402
+from racer.settings import RULES_VERSION  # noqa: E402
 
-spec = importlib.util.spec_from_file_location("game", SRC / "3D-game.py")
-game = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(game)
+README = ROOT / "README.md"
+TABLE_START = "<!-- leaderboard:start -->"
+TABLE_END = "<!-- leaderboard:end -->"
 
 TRIAL_SEEDS = range(5)
 BATTLE_SEEDS = range(12)
@@ -55,7 +60,7 @@ def time_trials(name):
     runs = []
     for seed in TRIAL_SEEDS:
         started = time.perf_counter()
-        race = game.simulate(name, "Time trial", seed, MAX_TIME)
+        race = simulate(name, "Time trial", seed, MAX_TIME)
         car = race.player
         runs.append(
             {
@@ -77,13 +82,50 @@ def battles():
     results = {name: [] for name in drivers.ALGORITHMS}
     for seed in BATTLE_SEEDS:
         camera = drivers.ALGORITHMS[seed % len(drivers.ALGORITHMS)]
-        race = game.simulate(camera, "Battle", seed, MAX_TIME)
-        for place, car in enumerate(game.standings(race), start=1):
+        race = simulate(camera, "Battle", seed, MAX_TIME)
+        for place, car in enumerate(standings(race), start=1):
             results[car.algorithm].append(place)
     return results
 
 
+def leaderboard_table(leaderboard):
+    """The README's markdown table for the rows of leaderboard.json."""
+    lines = [
+        "| # | Algorithm | Approach | Trial avg | Best | Battle avg place | Battle wins | CPU ms per race second |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for e in leaderboard["algorithms"]:
+        if e["trial_mean"] is None:
+            trial = "DNF"
+        else:
+            trial = f"{e['trial_mean']:.2f} s"
+            if not e["trial_finished"].startswith(str(leaderboard["trial_seeds"])):
+                trial += f" ({e['trial_finished']} finished)"
+        best = f"{e['trial_best']:.2f} s" if e["trial_best"] is not None else "-"
+        lines.append(
+            f"| {e['rank']} | {e['name']} | {e['family']} | {trial} | {best} | "
+            f"{e['battle_avg_place']:.2f} | {e['battle_wins']} | {e['cpu_ms_per_race_second']:.1f} |"
+        )
+    return "\n".join(lines)
+
+
+def with_table(readme_text, table):
+    """``readme_text`` with the text between the leaderboard markers replaced."""
+    start = readme_text.index(TABLE_START) + len(TABLE_START)
+    end = readme_text.index(TABLE_END)
+    return readme_text[:start] + "\n" + table + "\n" + readme_text[end:]
+
+
+def update_readme():
+    leaderboard = json.loads((ROOT / "leaderboard.json").read_text())
+    README.write_text(with_table(README.read_text(), leaderboard_table(leaderboard)))
+    print("README.md leaderboard table updated")
+
+
 def main():
+    if "--readme-only" in sys.argv:
+        update_readme()
+        return
     board = []
     best_run = None
     for name in drivers.ALGORITHMS:
@@ -105,10 +147,10 @@ def main():
         }
         if finished:
             best = min(finished, key=lambda r: r["time"])
-            ghost = game.Ghost(name, best["time"], best["frames"])
+            ghost = Ghost(name, best["time"], best["frames"])
             (ROOT / "ghosts").mkdir(exist_ok=True)
             (ROOT / "ghosts" / f"{slug(name)}.json").write_text(
-                json.dumps({"rules": game.RULES_VERSION, "name": name, "time": best["time"], "frames": best["frames"]})
+                json.dumps({"rules": RULES_VERSION, "name": name, "time": best["time"], "frames": best["frames"]})
             )
             if best_run is None or ghost.time < best_run.time:
                 best_run = ghost
@@ -127,7 +169,7 @@ def main():
     (ROOT / "leaderboard.json").write_text(
         json.dumps(
             {
-                "rules": game.RULES_VERSION,
+                "rules": RULES_VERSION,
                 "trial_seeds": len(TRIAL_SEEDS),
                 "battle_seeds": len(BATTLE_SEEDS),
                 "algorithms": board,
@@ -136,9 +178,11 @@ def main():
         )
     )
 
-    leader = game.load_ghost()
+    update_readme()
+
+    leader = load_ghost()
     if best_run is not None and (leader is None or best_run.time < leader.time):
-        game.save_ghost(best_run)
+        save_ghost(best_run)
         print(f"new leader ghost: {best_run.name} {best_run.time:.2f}s")
 
     print()

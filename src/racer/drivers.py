@@ -5,7 +5,7 @@ returns the same three values a keyboard gives: ``(steering, throttle, brake)``
 with steering in -1..1, throttle 0 or 1 and brake 0..1. That shared interface
 is what lets them race each other fairly.
 
-What a driver may ask the world (see ``World`` in 3D-game.py):
+What a driver may ask the world (see ``World`` in race.py):
 
     world.state(car)                 -> (distance, x, drift_speed, speed, boost_time)
     world.curve(distance)            -> how hard the road bends there
@@ -26,7 +26,7 @@ from pathlib import Path
 
 DISTANCE, X, DRIFT, SPEED, BOOST = range(5)
 LANES = (-2 / 3, 0.0, 2 / 3)
-WEIGHTS_DIR = Path(__file__).resolve().parent / "weights"
+WEIGHTS_DIR = Path(__file__).resolve().parents[1] / "weights"
 
 
 def clamp(value, low, high):

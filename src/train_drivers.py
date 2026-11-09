@@ -7,7 +7,6 @@ Training uses numpy (a dev dependency); driving does not, so the trained
 networks also run in the browser build.
 """
 
-import importlib.util
 import json
 import os
 import random
@@ -20,11 +19,9 @@ import numpy as np  # noqa: E402
 
 SRC = Path(__file__).resolve().parent
 sys.path.insert(0, str(SRC))
-import drivers  # noqa: E402
-
-spec = importlib.util.spec_from_file_location("game", SRC / "3D-game.py")
-game = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(game)
+from racer import drivers  # noqa: E402
+from racer.race import simulate  # noqa: E402
+from racer.settings import MAX_SPEED  # noqa: E402
 
 WEIGHTS = SRC / "weights"
 MAX_TIME = 60.0
@@ -152,7 +149,7 @@ def race_time(race):
     if car.finish_time is not None:
         return car.finish_time
     remaining = race.world.track_length - car.distance
-    return MAX_TIME + max(0.0, remaining) / game.MAX_SPEED
+    return MAX_TIME + max(0.0, remaining) / MAX_SPEED
 
 
 def train_imitation(rounds=5, seeds=(0, 1, 2, 3)):
@@ -165,14 +162,14 @@ def train_imitation(rounds=5, seeds=(0, 1, 2, 3)):
         started = time.time()
         for seed in seeds:
             dagger = DaggerDriver(student, beta, rng)
-            game.simulate("Baseline", "Time trial", seed, MAX_TIME, brain=dagger)
+            simulate("Baseline", "Time trial", seed, MAX_TIME, brain=dagger)
             for obs, target in dagger.samples:
                 inputs.append(obs)
                 targets.append(target)
         loss = fit(params, np.array(inputs), np.array(targets))
         student = NetDriver(to_net(params))
         times = [
-            race_time(game.simulate("Baseline", "Time trial", s, MAX_TIME, brain=NetDriver(to_net(params))))
+            race_time(simulate("Baseline", "Time trial", s, MAX_TIME, brain=NetDriver(to_net(params))))
             for s in seeds
         ]
         print(
@@ -188,7 +185,7 @@ def evaluate(vector, seeds):
     net = to_net(unflatten(vector))
     return float(
         np.mean(
-            [race_time(game.simulate("Baseline", "Time trial", s, MAX_TIME, brain=NetDriver(net))) for s in seeds]
+            [race_time(simulate("Baseline", "Time trial", s, MAX_TIME, brain=NetDriver(net))) for s in seeds]
         )
     )
 

@@ -1,7 +1,7 @@
 [project]
 name = "self-driving-racer"
 version = "0.1.0"
-description = "Add your description here"
+description = "A pseudo-3D racer where self-driving algorithms race one lap"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -11,4 +11,9 @@ dependencies = [
 [dependency-groups]
 dev = [
     "numpy>=2.5.4",
+    "pytest>=9.2.0",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
