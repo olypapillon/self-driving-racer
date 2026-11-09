@@ -4,10 +4,35 @@ A pseudo-3D arcade racer written in Python with pygame-ce, where six
 self-driving algorithms race one lap against each other. They range from
 hand-written rules to an evolved neural network.
 
-**▶ Play in your browser: https://olypapillon.github.io/self-driving-racer/**
+## ▶ [Watch them race in your browser](https://olypapillon.github.io/self-driving-racer/)
 
-(Click the page once to start. The first load takes a few seconds while Python
-loads in the browser.)
+**https://olypapillon.github.io/self-driving-racer/**
+
+Click the page once to start. The first load takes a few seconds while Python
+loads in the browser. Then:
+
+1. **Pick an algorithm** with keys `1`–`6`. The camera follows that car and it
+   starts a new race:
+
+   | Key | Algorithm |
+   |---|---|
+   | `1` | Baseline |
+   | `2` | Pure Pursuit |
+   | `3` | Stanley |
+   | `4` | MPC Planner (the default) |
+   | `5` | Imitation NN |
+   | `6` | Evolved NN |
+
+2. **Pick how they race** with `M`:
+   - **Battle:** all six algorithms on one grid, with slow traffic to get past.
+     The HUD shows your algorithm's position.
+   - **Time trial:** your algorithm alone on the track, chasing the blue ghost
+     of the fastest run so far. The HUD shows the gap to the ghost.
+3. **Speed it up** with `F` (1×, 2×, 4×, 8×), or press `Tab` to drive the car
+   yourself and see if you can beat them.
+
+When your car finishes, a results table shows the finishing order and fills in
+as the others cross the line.
 
 ## Leaderboard
 
