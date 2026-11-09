@@ -1,9 +1,15 @@
+import bisect
+import json
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 
 import pygame
+
+import drivers
+from drivers import ALGORITHMS
 
 
 SCREEN_WIDTH = 1100
@@ -57,9 +63,58 @@ PLAYER_Z_OFFSET = CAMERA_HEIGHT * CAMERA_DEPTH
 PLAYER_MASS = 1.0
 LANES_X = (-2 / 3, 0.0, 2 / 3)
 
-RACE_LAPS = 3
+RACE_LAPS = 1
 COUNTDOWN_SECONDS = 3.0
 GO_DISPLAY_SECONDS = 1.0
+# Fast-forward runs more fixed physics steps per drawn frame, so a race at 8x
+# is exactly the same race as at 1x, just shown sooner.
+SIM_SPEEDS = (1, 2, 4, 8)
+
+# The fastest finished run so far, replayed as a see-through car.
+GHOST_PATH = Path(__file__).resolve().parent.parent / "ghosts" / "leader.json"
+GHOST_TINT = (150, 200, 255)
+GHOST_OPACITY = 110  # out of 255
+GHOST_COLOR = (150, 200, 255)
+# Each algorithm keeps one colour everywhere: its car, mini map dot and results.
+ALGORITHM_COLORS = {
+    "Baseline": (230, 230, 230),
+    "Pure Pursuit": (70, 140, 255),
+    "Stanley": (255, 210, 60),
+    "MPC Planner": (70, 220, 120),
+    "Imitation NN": (190, 110, 255),
+    "Evolved NN": (255, 140, 50),
+}
+RACE_MODES = ("Battle", "Time trial")
+# Bump this whenever the track or physics change: ghosts from older rules are
+# ignored, since replaying them would no longer be a fair comparison.
+RULES_VERSION = 3
+
+# Track features, each one lane wide. Boost pads push you past the normal top
+# speed for a moment; mud slows you and takes away grip so the car slides.
+BOOST_DURATION = 1.5
+BOOST_MAX_SPEED = 1.35 * MAX_SPEED
+BOOST_ACCELERATION = 30 * SEGMENT_LENGTH
+# How quickly speed above the normal top speed bleeds away after a boost.
+BOOST_FADE = 8 * SEGMENT_LENGTH
+MUD_MAX_SPEED = 0.6 * MAX_SPEED
+MUD_DECELERATION = 40 * SEGMENT_LENGTH
+MUD_GRIP = 0.35  # steering strength and slide response are scaled by this
+MUD_SLIP = 6.0  # the random sideways push is this many times stronger
+FEATURE_HALF_WIDTH = 0.3  # in road half-widths; a lane is 1/3 either side
+# (kind, first segment, segment count, lane centre). Lap is 1680 segments:
+# per half, straight 0-40, hills 40-280, straight 280-300, bend 300-840.
+TRACK_FEATURES = (
+    ("boost", 20, 10, 0.0),
+    ("boost", 230, 10, 2 / 3),
+    ("mud", 330, 22, 0.0),
+    ("mud", 560, 22, -2 / 3),
+    ("boost", 870, 10, -2 / 3),
+    ("boost", 1080, 10, 0.0),
+    ("mud", 1190, 22, 2 / 3),
+    ("mud", 1450, 26, 0.0),
+)
+BOOST_COLORS = ((255, 200, 40), (255, 140, 20))
+MUD_COLORS = ((110, 72, 40), (92, 58, 32))
 # Two cars per grid row, the front row just behind the start line.
 GRID_ROW_GAP = 3 * CAR_LENGTH
 
@@ -155,6 +210,12 @@ TREE_WIDTH = 0.4
 TREE_IMAGE_SIZE = (160, 256)
 TREE_TRUNK_COLOR = (92, 60, 38)
 TREE_CROWN_COLORS = ((22, 82, 44), (30, 102, 54), (40, 122, 64))
+# Trees shorter than this near the horizon are a speck; skipping them is free.
+MIN_TREE_PIXELS = 2
+
+# Scaled copies of sprites, keyed by (image id, width, height); see blit_scaled.
+SCALED_SPRITES = {}
+SCALED_SPRITE_LIMIT = 3000
 
 SKY_WIDTH = SCREEN_WIDTH * 2
 SKY_HEIGHT = 560
@@ -177,6 +238,24 @@ CAR_SHADOW_VERTICAL_POSITION = 0.84
 PLAYER_CAR_SWAY = 32
 STEERING_ANIMATION_RESPONSE = 12
 STEERING_SPRITE_THRESHOLD = 0.22
+
+
+# The physics constants handed to the self-driving algorithms (World.P).
+PHYSICS = SimpleNamespace(
+    MAX_SPEED=MAX_SPEED,
+    HANDLING_REFERENCE_SPEED=HANDLING_REFERENCE_SPEED,
+    STEERING_GRIP_FALLOFF=STEERING_GRIP_FALLOFF,
+    PLAYER_LATERAL_SPEED=PLAYER_LATERAL_SPEED,
+    ROAD_CURVE_DRIFT_SPEED=ROAD_CURVE_DRIFT_SPEED,
+    DRIFT_RESPONSE_SLOW=DRIFT_RESPONSE_SLOW,
+    DRIFT_RESPONSE_FAST=DRIFT_RESPONSE_FAST,
+    AI_BRAKE_SLACK=AI_BRAKE_SLACK,
+    AI_BRAKING=AI_BRAKING,
+    BOOST_DURATION=BOOST_DURATION,
+    ROAD_WIDTH=ROAD_WIDTH,
+    CAR_LENGTH=CAR_LENGTH,
+    CAR_WIDTH=CAR_WIDTH,
+)
 
 
 def ease_in(start, end, percent):
@@ -247,13 +326,15 @@ def add_corner(track, enter, hold, leave, angle):
 
 
 def add_half_lap(track):
-    """A hilly straight and a 180-degree bend that ends back at height zero."""
-    add_straight(track, 60)
+    """A hilly straight and a 180-degree bend that ends back at height zero.
+
+    One hill per straight keeps the lap short (about 25 s); the bend is left
+    unchanged so corners drive exactly as before.
+    """
+    add_straight(track, 40)
     add_hill(track, 40, HILL_LOW)
     add_hill(track, 40, -HILL_LOW)
-    add_straight(track, 30)
-    add_hill(track, 45, HILL_LOW)
-    add_hill(track, 45, -HILL_LOW)
+    add_straight(track, 20)
     add_corner(track, 60, 420, 60, 180)
 
 
@@ -395,22 +476,30 @@ def format_lap_time(seconds):
     return f"{int(minutes)}:{seconds:05.2f}"
 
 
-def draw_hud(screen, font, race):
-    """Race position, lap count and times in a panel opposite the mini map."""
+def draw_hud(screen, font, race, ghost, autopilot, sim_speed):
+    """Driver, position, time and the gap to the ghost, opposite the mini map."""
     player = race.player
     order = standings(race)
-    lap_number = max(1, min(player.laps + 1, RACE_LAPS))
-    if player.lap_start is None or player.finish_time is not None:
-        lap_time = 0.0
-    else:
-        lap_time = race.clock - player.lap_start
+    # Everything is timed on the race clock from GO, the same clock the ghost
+    # was recorded on, so the two can be compared directly.
+    race_time = player.finish_time if player.finish_time is not None else race.clock
+    driver = player.algorithm if autopilot else "You (keyboard)"
     lines = [
+        (driver + (f"   >> {sim_speed}x" if sim_speed > 1 else ""), HUD_BEST_COLOR),
+        (race.mode, HUD_MUTED_COLOR),
         (f"Pos  {order.index(player) + 1}/{len(order)}", "white"),
-        (f"Lap  {lap_number}/{RACE_LAPS}", "white"),
-        (f"Time {format_lap_time(lap_time)}", "white"),
-        (f"Last {format_lap_time(player.last_lap)}", HUD_MUTED_COLOR),
-        (f"Best {format_lap_time(player.best_lap)}", HUD_BEST_COLOR),
+        (f"Time {format_lap_time(race_time)}", "white"),
     ]
+    if ghost is not None:
+        lines.append((f"Ghost {ghost.name} {format_lap_time(ghost.time)}", GHOST_COLOR))
+        if race.clock > 0:
+            # Positive: you reached this point later than the ghost did.
+            if player.finish_time is not None:
+                gap = player.finish_time - ghost.time
+            else:
+                gap = race.clock - ghost.time_at(player.distance)
+            gap_color = (120, 230, 120) if gap <= 0 else (240, 110, 110)
+            lines.append((f"Gap  {gap:+.2f} s", gap_color))
     rendered = [font.render(text, True, color) for text, color in lines]
     line_height = font.get_linesize()
     width = max(text.get_width() for text in rendered) + 2 * HUD_PADDING
@@ -437,10 +526,13 @@ def minimap_point(path, left, top, z):
     )
 
 
-def draw_minimap(screen, minimap, path, race, track_length):
+def draw_minimap(screen, minimap, path, race, track_length, ghost_car=None):
     left = SCREEN_WIDTH - MINIMAP_SIZE - MINIMAP_MARGIN
     top = MINIMAP_MARGIN
     screen.blit(minimap, (left, top))
+    if ghost_car is not None:
+        point = minimap_point(path, left, top, ghost_car.distance % track_length)
+        pygame.draw.circle(screen, GHOST_COLOR, point, MINIMAP_PLAYER_RADIUS, 2)
 
     # Traffic first, so racer dots sit on top of it.
     for car in sorted(race.cars, key=lambda car: car.driver != "traffic"):
@@ -485,6 +577,24 @@ def road_elevation_at(track, position):
     return near_y + (far_y - near_y) * segment_percent
 
 
+def build_features(track):
+    """Index the track features by segment for fast lookup and drawing."""
+    by_segment = [[] for _ in track]
+    for kind, first, count, lane_x in TRACK_FEATURES:
+        for index in range(first, first + count):
+            by_segment[index % len(track)].append((kind, lane_x))
+    return by_segment
+
+
+def feature_at(features, distance, x):
+    """'boost', 'mud' or None under a car at ``distance`` and lateral ``x``."""
+    segment = int(distance // SEGMENT_LENGTH) % len(features)
+    for kind, lane_x in features[segment]:
+        if abs(x - lane_x) <= FEATURE_HALF_WIDTH:
+            return kind
+    return None
+
+
 def surface_drag(player_x):
     """Extra deceleration and the speed it pulls down to, by road zone.
 
@@ -499,22 +609,36 @@ def surface_drag(player_x):
     return OFF_ROAD_DECELERATION, OFF_ROAD_MAX_SPEED
 
 
-def move_speed(speed, throttle, brake, player_x, dt):
+def move_speed(speed, throttle, brake, player_x, dt, boosting=False, on_mud=False):
     """Accelerate or brake while keeping forward speed within its limits.
 
-    Kerb and grass drag only pull speed down to their limit, so the throttle
-    can still crawl the car back onto the road.
+    Kerb, grass and mud drag only pull speed down to their limit, so the
+    throttle can still crawl the car out. A boost pushes on top of the throttle
+    and lifts the top speed; afterwards the extra speed fades instead of
+    vanishing at once.
     """
+    top_speed = BOOST_MAX_SPEED if boosting else MAX_SPEED
     if throttle:
-        speed += ACCELERATION * dt
+        # The engine alone never pushes past the normal top speed; only a
+        # boost does. (Without this check, holding the throttle out-pushed the
+        # fade below and kept a boost's extra speed forever. The evolved
+        # driver found and exploited exactly that.)
+        if speed < top_speed:
+            speed = min(top_speed, speed + ACCELERATION * dt)
     else:
         speed -= COAST_DECELERATION * dt
     speed -= brake * BRAKE_DECELERATION * dt
+    if boosting:
+        speed += BOOST_ACCELERATION * dt
 
     drag, limit = surface_drag(player_x)
+    if on_mud and limit > MUD_MAX_SPEED:
+        drag, limit = MUD_DECELERATION, MUD_MAX_SPEED
     if speed > limit:
         speed = max(limit, speed - drag * dt)
-    return max(0.0, min(speed, MAX_SPEED))
+    if speed > top_speed:
+        speed = max(top_speed, speed - BOOST_FADE * dt)
+    return max(0.0, min(speed, BOOST_MAX_SPEED))
 
 
 def update_wander(wander, wander_target, rng, dt):
@@ -528,7 +652,9 @@ def update_wander(wander, wander_target, rng, dt):
     return wander, wander_target
 
 
-def move_sideways(player_x, drift_speed, steering, road_curve, speed, wander, dt):
+def move_sideways(
+    player_x, drift_speed, steering, road_curve, speed, wander, dt, on_mud=False
+):
     """Move a car relative to the road while preserving a straight world heading.
 
     The player and the AI racers both drive through this, so they face exactly
@@ -542,15 +668,22 @@ def move_sideways(player_x, drift_speed, steering, road_curve, speed, wander, dt
     slide and keeps sliding after the key is released.
     """
     speed_ratio = speed / HANDLING_REFERENCE_SPEED
-    speed_fraction = speed / MAX_SPEED
+    # Past the normal top speed (boosting) handling stays as it is at the top.
+    speed_fraction = min(1.0, speed / MAX_SPEED)
     grip = 1.0 - STEERING_GRIP_FALLOFF * speed_fraction
     target_speed = steering * PLAYER_LATERAL_SPEED * speed_ratio * grip
     response = DRIFT_RESPONSE_SLOW + (
         DRIFT_RESPONSE_FAST - DRIFT_RESPONSE_SLOW
     ) * speed_fraction
+    slip = 1.0
+    if on_mud:
+        # Mud: the wheel barely bites and the slide is slow to answer it.
+        target_speed *= MUD_GRIP
+        response *= MUD_GRIP
+        slip = MUD_SLIP
     drift_speed += (target_speed - drift_speed) * min(1.0, response * dt)
     # The surface pushes the slide too, so the car wanders even on a straight.
-    drift_speed += wander * WANDER_STRENGTH * speed_fraction * dt
+    drift_speed += wander * WANDER_STRENGTH * slip * speed_fraction * dt
     road_turn_speed = road_curve * ROAD_CURVE_DRIFT_SPEED * speed_ratio**2
     return player_x + (drift_speed - road_turn_speed) * dt, drift_speed
 
@@ -581,6 +714,14 @@ class Car:
     cruise_speed: float = 0.0
     wander: float = 0.0
     wander_target: float = 0.0
+    boost_time: float = 0.0
+    surface: str | None = None  # "boost" or "mud" under the car, else None
+    algorithm: str = "Baseline"
+    brain: object = None  # a drivers.Driver, or None for the built-in baseline
+    # Race statistics, for the leaderboard.
+    mud_time: float = 0.0
+    grass_time: float = 0.0
+    boosts: int = 0
     # Lap bookkeeping, timed on the race clock. ``laps`` is -1 on the grid.
     laps: int = -1
     lap_start: float | None = None
@@ -596,6 +737,72 @@ class Race:
     speed_plan: tuple
     countdown: float = COUNTDOWN_SECONDS
     clock: float = 0.0
+    # Physics steps since GO, and the player's (distance, x) after each one;
+    # recording[0] is the grid position. A finished recording becomes a ghost.
+    steps: int = 0
+    recording: list = field(default_factory=list)
+    features: list = field(default_factory=list)  # per segment, see build_features
+    mode: str = "Battle"
+    world: object = None
+
+
+@dataclass
+class Ghost:
+    """A recorded run: ``frames[k]`` is the car's (distance, x) after k steps."""
+
+    name: str
+    time: float
+    frames: list
+
+    def at(self, steps):
+        """Where the ghost is after ``steps``, or None once it has finished."""
+        if steps >= len(self.frames):
+            return None
+        return self.frames[steps]
+
+    def time_at(self, distance):
+        """Race time at which the ghost reached ``distance``."""
+        distances = [frame[0] for frame in self.frames]
+        index = bisect.bisect_left(distances, distance)
+        return min(index, len(self.frames) - 1) * FIXED_STEP
+
+
+def load_ghost():
+    try:
+        data = json.loads(GHOST_PATH.read_text())
+        if data.get("rules") != RULES_VERSION:
+            return None
+        return Ghost(data["name"], data["time"], [tuple(f) for f in data["frames"]])
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def save_ghost(ghost):
+    """Keep the leader's run between sessions (a no-op where files can't be written)."""
+    try:
+        GHOST_PATH.parent.mkdir(exist_ok=True)
+        GHOST_PATH.write_text(
+            json.dumps(
+                {
+                    "rules": RULES_VERSION,
+                    "name": ghost.name,
+                    "time": ghost.time,
+                    "frames": ghost.frames,
+                }
+            )
+        )
+    except OSError:
+        pass
+
+
+def build_ghost_image(car_image):
+    """A pale blue, see-through copy of the car."""
+    image = pygame.transform.grayscale(car_image)
+    image.fill((CAR_TINT_LIFT,) * 3, special_flags=pygame.BLEND_RGB_ADD)
+    image.fill(GHOST_TINT, special_flags=pygame.BLEND_RGB_MULT)
+    # Scale each pixel's own alpha, so the see-through look survives scaling.
+    image.fill((255, 255, 255, GHOST_OPACITY), special_flags=pygame.BLEND_RGBA_MULT)
+    return image
 
 
 def build_car_image(car_image, color, mass):
@@ -612,16 +819,17 @@ def build_car_image(car_image, color, mass):
     return image
 
 
-def build_race(car_image, track):
-    """A fresh race: the player and the racers on the grid, traffic spread out.
+def build_race(car_image, track, algorithm="Baseline", mode="Battle", seed=0):
+    """A fresh race for the player's car, driven by ``algorithm``.
 
+    Battle: every other algorithm races too, on a grid shuffled by ``seed``,
+    with slow traffic on the road. Time trial: the player's car alone.
     The player is first in ``cars``. Bumps only ever move the second car of a
     pair, so the camera car is never teleported.
     """
     track_length = len(track) * SEGMENT_LENGTH
-    rng = random.Random(RACER_SEED)
     player = Car(
-        name="You",
+        name=algorithm,
         driver="player",
         distance=0.0,
         x=0.0,
@@ -629,61 +837,137 @@ def build_race(car_image, track):
         size=1.0,
         color=MINIMAP_PLAYER_COLOR,
         image=car_image,
-        rng=random.Random(WANDER_SEED),
+        rng=random.Random(WANDER_SEED + 1000 * seed),
+        algorithm=algorithm,
+        brain=drivers.make_driver(algorithm),
     )
     racers = []
-    for index, (name, color) in enumerate(RACER_COLORS[:RACER_COUNT]):
-        mass = rng.uniform(RACER_MIN_MASS, RACER_MAX_MASS)
-        racers.append(
-            Car(
-                name=name,
-                driver="racer",
-                distance=0.0,
-                x=0.0,
-                mass=mass,
-                size=mass ** (1 / 3),
-                color=color,
-                image=build_car_image(car_image, color, mass),
-                rng=random.Random(WANDER_SEED + 1 + index),
-                skill=rng.uniform(RACER_MIN_SKILL, RACER_MAX_SKILL),
+    traffic = []
+    if mode == "Battle":
+        rivals = [name for name in ALGORITHMS if name != algorithm]
+        random.Random(RACER_SEED + seed).shuffle(rivals)
+        for index, name in enumerate(rivals):
+            color = ALGORITHM_COLORS[name]
+            racers.append(
+                Car(
+                    name=name,
+                    driver="racer",
+                    distance=0.0,
+                    x=0.0,
+                    mass=PLAYER_MASS,
+                    size=1.0,
+                    color=color,
+                    image=build_car_image(car_image, color, PLAYER_MASS),
+                    rng=random.Random(WANDER_SEED + 1000 * seed + 1 + index),
+                    algorithm=name,
+                    brain=drivers.make_driver(name),
+                )
             )
-        )
+        rng = random.Random(TRAFFIC_SEED + seed)
+        for index in range(TRAFFIC_COUNT):
+            mass = rng.uniform(TRAFFIC_MIN_MASS, TRAFFIC_MAX_MASS)
+            speed = rng.uniform(TRAFFIC_MIN_SPEED, TRAFFIC_MAX_SPEED)
+            lane = rng.choice(LANES_X)
+            traffic.append(
+                Car(
+                    name="Traffic",
+                    driver="traffic",
+                    distance=track_length * (index + 1) / (TRAFFIC_COUNT + 1),
+                    x=lane,
+                    target_x=lane,
+                    mass=mass,
+                    # Bigger with mass, but gently: a cube root keeps 1.6x mass
+                    # about 1.2x wider rather than 1.6x.
+                    size=mass ** (1 / 3),
+                    color=TRAFFIC_COLOR,
+                    image=build_car_image(car_image, TRAFFIC_COLOR, mass),
+                    rng=rng,
+                    speed=speed,
+                    cruise_speed=speed,
+                )
+            )
 
-    # Fill the grid two by two from the front; the player starts last.
+    # Fill the grid two by two from the front; the player starts last. In a
+    # time trial the player is alone, so it starts on the front row.
     grid = racers + [player]
     for slot, car in enumerate(grid):
         car.distance = -CAR_LENGTH - (slot // 2) * GRID_ROW_GAP
         car.x = car.target_x = LANES_X[0] if slot % 2 else LANES_X[2]
 
-    rng = random.Random(TRAFFIC_SEED)
-    traffic = []
-    for index in range(TRAFFIC_COUNT):
-        mass = rng.uniform(TRAFFIC_MIN_MASS, TRAFFIC_MAX_MASS)
-        speed = rng.uniform(TRAFFIC_MIN_SPEED, TRAFFIC_MAX_SPEED)
-        lane = rng.choice(LANES_X)
-        traffic.append(
-            Car(
-                name="Traffic",
-                driver="traffic",
-                distance=track_length * (index + 1) / (TRAFFIC_COUNT + 1),
-                x=lane,
-                target_x=lane,
-                mass=mass,
-                # Bigger with mass, but gently: a cube root keeps 1.6x mass
-                # about 1.2x wider rather than 1.6x.
-                size=mass ** (1 / 3),
-                color=TRAFFIC_COLOR,
-                image=build_car_image(car_image, TRAFFIC_COLOR, mass),
-                rng=rng,
-                speed=speed,
-                cruise_speed=speed,
-            )
-        )
-    return Race(
+    race = Race(
         cars=[player] + racers + traffic,
         player=player,
         speed_plan=build_speed_plan(track),
+        features=build_features(track),
+        recording=[(player.distance, player.x)],
+        mode=mode,
     )
+    race.world = World(race, track, track_length)
+    return race
+
+
+class World:
+    """What the self-driving algorithms in drivers.py are allowed to know.
+
+    Keeping this the only door into the game means every algorithm sees the
+    same information, and a new algorithm never needs game internals.
+    """
+
+    def __init__(self, race, track, track_length):
+        self.race = race
+        self.track = track
+        self.track_length = track_length
+        self.P = PHYSICS
+
+    @staticmethod
+    def state(car):
+        return (car.distance, car.x, car.drift_speed, car.speed, car.boost_time)
+
+    def curve(self, distance):
+        return road_curve_at(self.track, distance % self.track_length)
+
+    def planned_speed(self, distance):
+        return planned_speed(self.race.speed_plan, distance % self.track_length)
+
+    def feature(self, distance, x):
+        return feature_at(self.race.features, distance, x)
+
+    def features_ahead(self, distance, horizon):
+        """Pads and mud whose start is within ``horizon`` ahead (0 if already on)."""
+        z = distance % self.track_length
+        found = []
+        for kind, first, count, lane_x in TRACK_FEATURES:
+            start = first * SEGMENT_LENGTH
+            end = (first + count) * SEGMENT_LENGTH
+            if start <= z < end:
+                gap = 0.0
+            else:
+                gap = (start - z) % self.track_length
+            if gap < horizon:
+                found.append((gap, kind, lane_x))
+        return found
+
+    def others(self, car):
+        return [
+            (track_gap(car.distance, other.distance, self.track_length), other.x, other.speed)
+            for other in self.race.cars
+            if other is not car
+        ]
+
+    def step(self, state, steering, throttle, brake, dt):
+        """The game's physics for one step, minus the random wander."""
+        distance, x, drift, speed, boost_time = state
+        surface = feature_at(self.race.features, distance, x)
+        if surface == "boost":
+            boost_time = BOOST_DURATION
+        on_mud = surface == "mud"
+        speed = move_speed(speed, throttle, brake, x, dt, boost_time > 0, on_mud)
+        boost_time = max(0.0, boost_time - dt)
+        distance += speed * dt
+        x, drift = move_sideways(
+            x, drift, steering, self.curve(distance), speed, 0.0, dt, on_mud
+        )
+        return (distance, x, drift, speed, boost_time)
 
 
 def track_gap(from_distance, to_distance, track_length):
@@ -814,10 +1098,23 @@ def ai_driver(car, race, track, track_length):
     return max(-1.0, min(1.0, steering)), throttle, brake
 
 
-def drive(car, track, track_length, steering, throttle, brake, dt):
+def drive(car, track, track_length, steering, throttle, brake, dt, features):
     """Move a player or racer with the shared vehicle physics."""
     car.steering = steering
-    car.speed = move_speed(car.speed, throttle, brake, car.x, dt)
+    previous_surface = car.surface
+    car.surface = feature_at(features, car.distance, car.x)
+    if car.surface == "boost":
+        car.boost_time = BOOST_DURATION
+        if previous_surface != "boost" and car.finish_time is None:
+            car.boosts += 1
+    if car.finish_time is None:
+        car.mud_time += dt * (car.surface == "mud")
+        car.grass_time += dt * (abs(car.x) > 1 + KERB_WIDTH)
+    on_mud = car.surface == "mud"
+    car.speed = move_speed(
+        car.speed, throttle, brake, car.x, dt, car.boost_time > 0, on_mud
+    )
+    car.boost_time = max(0.0, car.boost_time - dt)
     car.distance += car.speed * dt
     car.wander, car.wander_target = update_wander(
         car.wander, car.wander_target, car.rng, dt
@@ -830,6 +1127,7 @@ def drive(car, track, track_length, steering, throttle, brake, dt):
         car.speed,
         car.wander,
         dt,
+        on_mud,
     )
 
 
@@ -936,7 +1234,8 @@ def bump_cars(cars, track_length):
 
 
 def update_race(race, track, track_length, controls, dt):
-    """One fixed physics step. ``controls`` is the keyboard's (steer, throttle, brake).
+    """One fixed physics step. ``controls`` is the keyboard's (steer, throttle, brake),
+    or None when the autopilot drives the player's car.
 
     Once the player finishes, the AI takes over their car for the lap of honour.
     """
@@ -944,17 +1243,24 @@ def update_race(race, track, track_length, controls, dt):
         race.countdown -= dt
         return
     race.clock += dt
+    race.steps += 1
     for car in race.cars:
         if car.driver == "traffic":
             drive_traffic(car, dt)
             continue
-        if car is race.player and car.finish_time is None:
+        if car is race.player and car.finish_time is None and controls is not None:
             steering, throttle, brake = controls
+        elif car.brain is not None:
+            steering, throttle, brake = car.brain.drive(race.world, car)
         else:
             steering, throttle, brake = ai_driver(car, race, track, track_length)
-        drive(car, track, track_length, steering, throttle, brake, dt)
+        drive(car, track, track_length, steering, throttle, brake, dt, race.features)
         count_laps(race, car, track_length)
     bump_cars(race.cars, track_length)
+    player = race.player
+    # Record every step up to and including the one that crosses the line.
+    if player.finish_time is None or player.finish_time == race.clock:
+        race.recording.append((round(player.distance, 1), round(player.x, 4)))
 
 
 def project_point(camera_x, camera_y, camera_z):
@@ -979,6 +1285,7 @@ def projected_road(track, position, player_x, camera_y):
     curve_velocity = -(track[base_index][0] * base_percent)
     max_y = SCREEN_HEIGHT
     visible = []
+    previous_far = None
 
     for distance in range(DRAW_DISTANCE):
         segment_index = (base_index + distance) % segment_count
@@ -988,12 +1295,17 @@ def projected_road(track, position, player_x, camera_y):
         near_z = segment_index * SEGMENT_LENGTH + loop_offset
         far_z = near_z + SEGMENT_LENGTH
 
-        near = project_point(
-            player_x * ROAD_WIDTH - curve_offset,
-            near_world_y - camera_y,
-            near_z - position,
-        )
-        far = project_point(
+        # Each segment starts exactly where the previous one ended (same x
+        # offset, height and depth), so its near edge is the last far edge.
+        if distance:
+            near = previous_far
+        else:
+            near = project_point(
+                player_x * ROAD_WIDTH - curve_offset,
+                near_world_y - camera_y,
+                near_z - position,
+            )
+        far = previous_far = project_point(
             player_x * ROAD_WIDTH - curve_offset - curve_velocity,
             far_world_y - camera_y,
             far_z - position,
@@ -1139,6 +1451,26 @@ def draw_segment(screen, near, far, segment_index):
             )
 
 
+def draw_features(screen, near, far, segment_features, segment_index):
+    """Paint boost pads and mud patches as lane-wide strips on the road."""
+    near_x, near_y, near_width = near
+    far_x, far_y, far_width = far
+    stripe = segment_index % 2
+    for kind, lane_x in segment_features:
+        color = (BOOST_COLORS if kind == "boost" else MUD_COLORS)[stripe]
+        left, right = lane_x - FEATURE_HALF_WIDTH, lane_x + FEATURE_HALF_WIDTH
+        pygame.draw.polygon(
+            screen,
+            color,
+            [
+                (near_x + left * near_width, near_y),
+                (near_x + right * near_width, near_y),
+                (far_x + right * far_width, far_y),
+                (far_x + left * far_width, far_y),
+            ],
+        )
+
+
 def blit_scaled(screen, image, rect):
     """Draw ``image`` stretched to ``rect``, scaling only the on-screen part.
 
@@ -1147,6 +1479,17 @@ def blit_scaled(screen, image, rect):
     """
     visible = rect.clip(screen.get_rect())
     if not visible.width or not visible.height:
+        return
+    if visible == rect:
+        # Fully on screen: sprites recur at the same few sizes frame after
+        # frame, so keep each scaled copy instead of rescaling it every time.
+        key = (id(image), rect.width, rect.height)
+        scaled = SCALED_SPRITES.get(key)
+        if scaled is None:
+            if len(SCALED_SPRITES) > SCALED_SPRITE_LIMIT:
+                SCALED_SPRITES.clear()
+            scaled = SCALED_SPRITES[key] = pygame.transform.scale(image, rect.size)
+        screen.blit(scaled, rect)
         return
     to_image_x = image.get_width() / rect.width
     to_image_y = image.get_height() / rect.height
@@ -1181,7 +1524,7 @@ def draw_trees(screen, tree_image, segment_trees, near):
             road_x + offset * half_width,
             road_y,
         )
-        if rect:
+        if rect and rect.height >= MIN_TREE_PIXELS:
             blit_scaled(screen, tree_image, rect)
 
 
@@ -1218,6 +1561,7 @@ def draw_road(
     camera_y,
     sky,
     sky_offset,
+    features,
 ):
     cars_by_segment = {}
     for car in cars:
@@ -1243,6 +1587,10 @@ def draw_road(
             span_far = span_far or far
             if near[1] - span_far[1] >= 1:
                 draw_segment(screen, near, span_far, segment_index)
+                if features[segment_index]:
+                    draw_features(
+                        screen, near, span_far, features[segment_index], segment_index
+                    )
                 span_far = None
         if trees[segment_index]:
             draw_trees(screen, tree_image, trees[segment_index], near)
@@ -1278,7 +1626,7 @@ def draw_results(screen, font, race):
         name = font.render(f"{place}. {car.name}", True, color)
         rows.append((name, font.render(result, True, color)))
     title = font.render("Results", True, HUD_BEST_COLOR)
-    footer = font.render("R to restart", True, HUD_MUTED_COLOR)
+    footer = font.render("R restart  |  Tab drive yourself", True, HUD_MUTED_COLOR)
 
     # Names and times in two columns; the font is not monospaced.
     name_width = max(name.get_width() for name, _ in rows)
@@ -1305,8 +1653,8 @@ def main():
     clock = pygame.time.Clock()
     screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
     pygame.display.set_caption(
-        "Self-Driving Racer | W/Up: accelerate | S/Down: brake | A/D: steer"
-        " | R: restart"
+        "Self-Driving Racer | 1-6: algorithm | M: battle / time trial"
+        " | F: fast-forward | Tab: drive yourself | R: restart"
     )
 
     car_path = Path(__file__).resolve().parent.parent / "assets" / "car-rear.png"
@@ -1353,9 +1701,24 @@ def main():
     track = build_track()
     track_length = len(track) * SEGMENT_LENGTH
     minimap, minimap_path = build_minimap(track)
+    for kind, first, count, _ in TRACK_FEATURES:
+        middle = (first + count / 2) * SEGMENT_LENGTH
+        color = BOOST_COLORS[0] if kind == "boost" else MUD_COLORS[0]
+        pygame.draw.circle(minimap, color, minimap_point(minimap_path, 0, 0, middle), 4)
     trees = build_trees(track)
     tree_image = build_tree_image()
-    race = build_race(car_image, track)
+    algorithm_index = ALGORITHMS.index("MPC Planner")
+    mode_index = 0
+    race = build_race(car_image, track, ALGORITHMS[algorithm_index], RACE_MODES[mode_index])
+    ghost = load_ghost()
+    ghost_image = build_ghost_image(car_image)
+    ghost_car = Car(
+        name="Ghost", driver="ghost", distance=0.0, x=0.0, mass=1.0, size=1.0,
+        color=GHOST_COLOR, image=ghost_image, rng=random.Random(0),
+    )
+    autopilot = True
+    sim_speed_index = 0
+    leader_checked = None
     sky_offset = 0.0
     visual_steering = 0.0
     accumulator = 0.0
@@ -1369,13 +1732,31 @@ def main():
         # then run no physics step and others two, which reads as jumping.
         # tick_busy_loop() waits precisely at the cost of a little CPU.
         frame_time = min(clock.tick_busy_loop(FPS) / 1000, 0.25)
-        accumulator += frame_time
+        sim_speed = SIM_SPEEDS[sim_speed_index]
+        accumulator += frame_time * sim_speed
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_TAB:
+                autopilot = not autopilot
+                if not autopilot:
+                    # Fast-forward is for watching the AI; you drive at 1x.
+                    sim_speed_index = 0
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_f and autopilot:
+                sim_speed_index = (sim_speed_index + 1) % len(SIM_SPEEDS)
+            elif event.type == pygame.KEYDOWN and pygame.K_1 <= event.key < pygame.K_1 + len(ALGORITHMS):
+                algorithm_index = event.key - pygame.K_1
+                race = build_race(car_image, track, ALGORITHMS[algorithm_index], RACE_MODES[mode_index])
+                sky_offset = 0.0
+                visual_steering = 0.0
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_m:
+                mode_index = (mode_index + 1) % len(RACE_MODES)
+                race = build_race(car_image, track, ALGORITHMS[algorithm_index], RACE_MODES[mode_index])
+                sky_offset = 0.0
+                visual_steering = 0.0
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_r:
-                race = build_race(car_image, track)
+                race = build_race(car_image, track, ALGORITHMS[algorithm_index], RACE_MODES[mode_index])
                 sky_offset = 0.0
                 visual_steering = 0.0
 
@@ -1386,9 +1767,10 @@ def main():
         throttle = int(keys[pygame.K_w] or keys[pygame.K_UP])
         brake = int(keys[pygame.K_s] or keys[pygame.K_DOWN])
         player = race.player
+        player.name = player.algorithm if autopilot else "You"
 
         while accumulator >= FIXED_STEP:
-            controls = (steering, throttle, brake)
+            controls = None if autopilot else (steering, throttle, brake)
             update_race(race, track, track_length, controls, FIXED_STEP)
             road_curve = road_curve_at(track, player.distance % track_length)
             sky_offset += SKY_PARALLAX_SPEED * road_curve * player.speed * FIXED_STEP
@@ -1396,6 +1778,20 @@ def main():
             animation_blend = min(1.0, STEERING_ANIMATION_RESPONSE * FIXED_STEP)
             visual_steering += (animation_target - visual_steering) * animation_blend
             accumulator -= FIXED_STEP
+
+        # A finished run that beats the ghost becomes the new ghost. Checked
+        # once per race; the recording stopped at the finish line.
+        if player.finish_time is not None and leader_checked is not race:
+            leader_checked = race
+            if ghost is None or player.finish_time < ghost.time:
+                name = race.player.algorithm if autopilot else "You"
+                ghost = Ghost(name, player.finish_time, list(race.recording))
+                save_ghost(ghost)
+
+        frame = ghost.at(race.steps) if ghost is not None else None
+        ghost_visible = frame is not None
+        if ghost_visible:
+            ghost_car.distance, ghost_car.x = frame
 
         # The camera sits PLAYER_Z_OFFSET behind the car it follows.
         position = (player.distance - PLAYER_Z_OFFSET) % track_length
@@ -1405,12 +1801,13 @@ def main():
             track,
             trees,
             tree_image,
-            race.cars[1:],
+            race.cars[1:] + ([ghost_car] if ghost_visible else []),
             position,
             player.x,
             camera_y,
             sky,
             sky_offset,
+            race.features,
         )
         car_center_x = SCREEN_WIDTH // 2 + round(visual_steering * PLAYER_CAR_SWAY)
         car_shadow_rect.centerx = car_center_x
@@ -1428,14 +1825,42 @@ def main():
         )
         screen.blit(car_shadow, car_shadow_rect)
         screen.blit(rendered_car, rendered_car_rect)
-        draw_minimap(screen, minimap, minimap_path, race, track_length)
-        draw_hud(screen, hud_font, race)
+        draw_minimap(
+            screen, minimap, minimap_path, race, track_length,
+            ghost_car if ghost_visible else None,
+        )
+        draw_hud(screen, hud_font, race, ghost, autopilot, sim_speed)
         draw_countdown(screen, countdown_font, race)
         if player.finish_time is not None:
             draw_results(screen, results_font, race)
         pygame.display.flip()
 
     pygame.quit()
+
+
+def simulate(algorithm, mode="Time trial", seed=0, max_time=90.0, brain=None, on_step=None):
+    """Run one race with no window, as fast as the computer allows.
+
+    ``brain`` replaces the player's driver (used when training a network);
+    ``on_step(race)`` is called after every physics step. Returns the race.
+    """
+    if not pygame.get_init():
+        pygame.init()
+    track = build_track()
+    track_length = len(track) * SEGMENT_LENGTH
+    race = build_race(pygame.Surface((4, 4), pygame.SRCALPHA), track, algorithm, mode, seed)
+    if brain is not None:
+        brain.reset()
+        race.player.brain = brain
+    racers = [car for car in race.cars if car.driver != "traffic"]
+    race.countdown = 0.0  # no need to wait for 3-2-1 without a screen
+    while race.clock < max_time:
+        update_race(race, track, track_length, None, FIXED_STEP)
+        if on_step is not None:
+            on_step(race)
+        if all(car.finish_time is not None for car in racers):
+            break
+    return race
 
 
 if __name__ == "__main__":

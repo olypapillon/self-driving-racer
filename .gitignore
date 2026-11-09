@@ -12,9 +12,12 @@ wheels/
 # macOS
 .DS_Store
 
-# Rendered Manim output (regenerate from the explainer scripts)
-explainers/**/media/
+# Manim explainers (personal learning material, not pushed)
+explainers/
 
 # Local tool settings and personal learning notes
 .claude/settings.local.json
 .vibe-wise/
+
+# Private notes and videos (not pushed to GitHub)
+private/
