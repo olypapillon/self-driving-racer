@@ -1,20 +1,25 @@
 # Self-Driving Racer
 
 A pseudo-3D arcade racer written in Python with pygame-ce, where six
-self-driving algorithms race one lap against each other. They range from
-hand-written rules to an evolved neural network.
+self-driving algorithms race one lap against each other, and you can race
+them too. The algorithms range from hand-written rules to an evolved neural
+network.
 
 ## ▶ [Watch them race in your browser](https://olypapillon.github.io/self-driving-racer/)
 
 **https://olypapillon.github.io/self-driving-racer/**
 
 Click the page once to start. The first load takes a few seconds while Python
-loads in the browser. Then:
+loads in the browser.
 
-1. **Pick an algorithm** with keys `1`–`6`. The camera follows that car and it
-   starts a new race:
+The screen has three parts: **who drives** and the race controls on the left,
+the race in the middle, and the **leaderboard** on the right. Click the
+buttons, or use the keys:
 
-   | Key | Algorithm |
+1. **Pick who drives** (keys `1`–`7`). The camera follows that car and a new
+   race starts:
+
+   | Key | Driver |
    |---|---|
    | `1` | Baseline |
    | `2` | Pure Pursuit |
@@ -22,14 +27,19 @@ loads in the browser. Then:
    | `4` | MPC Planner (the default) |
    | `5` | Imitation NN |
    | `6` | Evolved NN |
+   | `7` | **You**: drive with the arrows or WASD |
 
-2. **Pick how they race** with `M`:
-   - **Battle:** all six algorithms on one grid, with slow traffic to get past.
-     The HUD shows your algorithm's position.
-   - **Time trial:** your algorithm alone on the track, chasing the blue ghost
-     of the fastest run so far. The HUD shows the gap to the ghost.
-3. **Speed it up** with `F` (1×, 2×, 4×, 8×), or press `Tab` to drive the car
-   yourself and see if you can beat them.
+2. **Pick the race** (`M`):
+   - **Battle:** everyone on one grid, with slow traffic to get past. Pick
+     *You* and all six algorithms race you.
+   - **Time trial:** alone on the track, chasing the blue ghost of the fastest
+     run so far. The HUD shows the gap to the ghost.
+3. **Pick the speed** (`F`): 1×, 2×, 4× or 8× fast-forward while an algorithm
+   drives. It only changes how quickly the race is shown, not the race itself.
+
+Your best time-trial lap and best battle place go on the leaderboard next to
+the algorithms, saved in your browser. `Tab` takes over the car mid-race (or
+hands it back), but those runs don't count. `R` restarts.
 
 When your car finishes, a results table shows the finishing order and fills in
 as the others cross the line.
@@ -60,13 +70,15 @@ it. The physics allow both; the other drivers are just more cautious.
 
 | Key | Action |
 |---|---|
-| `1`–`6` | Pick the algorithm driving your car |
+| `1`–`7` | Pick who drives: an algorithm, or you (`7`) |
+| Arrows / WASD | Drive, when you are driving |
 | `M` | Switch between battle and time trial |
 | `F` | Fast-forward (1×, 2×, 4×, 8×) |
-| `Tab` | Take the wheel yourself (arrows or WASD) |
+| `Tab` | Take over the car mid-race, or hand it back |
 | `R` | Restart the race |
 
-The see-through blue car is the ghost of the fastest run so far.
+Everything is clickable in the side panel as well. The see-through blue car is
+the ghost of the fastest run so far.
 
 ## The track
 
